@@ -122,8 +122,56 @@ def detect_max(html):
     return min(score, 1.0)
 
 
+# Adam’s detector requirements
+REQUIRED_HEADERS_ADAM = {"place", "athlete", "grade", "school", "time"}
+
+
 def detect_adam(html):
-    return 0.0    # TODO
+    soup = BeautifulSoup(html, "html.parser")
+    score = 0.0
+
+    # Adam format always lives inside #meetResultsBody
+    container = soup.find(id="meetResultsBody")
+    if not container:
+        return 0.0
+
+    tables = container.find_all("table")
+    if not tables:
+        return 0.0
+
+    # Strong match for finding tables inside meetResultsBody
+    score += 0.65
+
+    # Look for required headers inside any table
+    headers_score = 0
+    for tbl in tables:
+        headers = {
+            th.get_text(" ", strip=True).lower()
+            for th in tbl.find_all(["th", "td"])
+        }
+
+        intersection = REQUIRED_HEADERS_ADAM.intersection(headers)
+        if intersection:
+            headers_score = max(
+                headers_score,
+                len(intersection) / len(REQUIRED_HEADERS_ADAM)
+            )
+
+    score += 0.30 * headers_score
+
+    # Small bonus if results page selector exists in header
+    header_structure = soup.find("form", id="frmMeetResultsDetailFilter")
+    if header_structure:
+        select_box = header_structure.find("select", id="ddResultsPage")
+        if select_box and select_box.find_all("option"):
+            score += 0.20
+
+    # Bonus if multiple tables
+    if len(tables) >= 2:
+        score += 0.05
+
+    return float(min(score, 1.0))
+
 
 
 # --------------------------------------------
@@ -167,7 +215,82 @@ def wrangle_cole(html, race_url=None):
 
 
 def wrangle_max(html, race_url=None):
-    return pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS), pd.DataFrame(columns=TEAM_TABLE_HEADERS)
+    """
+    Parses Milesplit 'Max format' pages where results live inside <div id="meetResultsBody">
+    and the results are shown inside a <pre> block.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    container = soup.find("div", id="meetResultsBody")
+    if not container:
+        return (
+            pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS),
+            pd.DataFrame(columns=TEAM_TABLE_HEADERS)
+        )
+
+    pre = container.find("pre")
+    if not pre:
+        return (
+            pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS),
+            pd.DataFrame(columns=TEAM_TABLE_HEADERS)
+        )
+
+    text = pre.get_text("\n", strip=True)
+
+    # Split into sections such as "Varsity Boys", "JV Girls", etc.
+    sections = re.split(r'(?=\b[A-Z][A-Za-z/ &-]+ (?:Boys|Girls)\b)', text)
+
+    rows = []
+
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+
+        # Extract division header
+        header_match = re.match(r'^([A-Z][A-Za-z/ &/-]+ (?:Boys|Girls))', section)
+        if not header_match:
+            continue
+
+        division_name = header_match.group(1).strip()
+
+        # Process each result line starting with a place number
+        for line in section.splitlines():
+            line = line.strip()
+            if not re.match(r'^\d+\s', line):
+                continue
+
+            # Pattern from Max’s notebook
+            match = re.match(
+                r'^(\d+)\s+([A-Za-z\'\-. ]+?)\s+(FR|SO|JR|SR)\s+([A-Za-z\'\-. ]+?)\s+\d*:?[\d.]*\s+(\d+:\d+(?:\.\d+)?)\s+(\d+)?$',
+                line
+            )
+
+            if not match:
+                continue
+
+            place, athlete, grade, team, finish, point = match.groups()
+
+            rows.append({
+                "place": int(place),
+                "video": None,
+                "athlete": athlete.strip().title(),
+                "grade": grade,
+                "team": team.strip(),
+                "finish": finish,
+                "point": point if point else pd.NA
+            })
+
+    if not rows:
+        return (
+            pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS),
+            pd.DataFrame(columns=TEAM_TABLE_HEADERS)
+        )
+
+    indiv_df = pd.DataFrame(rows, columns=INDIVIDUAL_TABLE_HEADERS)
+
+    return indiv_df, pd.DataFrame(columns=TEAM_TABLE_HEADERS)
+
 
 
 def wrangle_adam(html, race_url=None):
