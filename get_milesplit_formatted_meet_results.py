@@ -4,107 +4,67 @@ from playwright.sync_api import sync_playwright
 import re
 import os
 
-# Constants
 INDIVIDUAL_TABLE_HEADERS = ['place', 'video', 'athlete', 'grade', 'team', 'finish', 'point']
 TEAM_TABLE_HEADERS = ['place', 'tsTeam', 'point', 'wind', 'heat']
 
-# Function to extract the race ID from the URL
+
+# --------------------------------------------
+# Extract race ID
+# --------------------------------------------
 def extract_race_id(url):
     match = re.search(r'results/(\d+)/', url)
     return match.group(1) if match else None
 
-# Function to extract table data from the page content
-def extract_table_data(page_content, url):
-    race_id = extraccheckt_race_id(url)
-    soup = BeautifulSoup(page_content, 'html.parser')
-    tables = soup.find_all('table')
 
-    if not tables:
-        print(f"No tables found for URL: {url}")
-        return {"individual": pd.DataFrame(), "team": pd.DataFrame()}, pd.DataFrame()
+# --------------------------------------------
+# DETECTORS
+# --------------------------------------------
+REQUIRED_HEADERS_KATIE = {"place", "video", "athlete", "team", "mark", "points"}
 
-    all_data = {"individual": [], "team": []}
-    metadata = []
-
-    for table_index, table in enumerate(tables):
-        rows = table.find_all('tr')
-        if not rows:
-            metadata.append({
-                "race_id": race_id,
-                "url": url,
-                "table_index": table_index + 1,
-                "table_type": "empty",
-                "row_count": 0
-            })
-            continue
-
-        # Extract headers from the first row
-        first_row = rows[1]
-        headers = [cell.get('class', [None])[0] for cell in first_row.find_all('td')]
-
-        # Determine the table type
-        if all(header in INDIVIDUAL_TABLE_HEADERS for header in headers):
-            table_type = "individual"
-        elif all(header in TEAM_TABLE_HEADERS for header in headers):
-            table_type = "team"
-        else:
-            metadata.append({
-                "race_id": race_id,
-                "url": url,
-                "table_index": table_index + 1,
-                "table_type": "unknown_headers",
-                "row_count": len(rows) - 1
-            })
-            continue
-
-        # Extract data from the rows
-        for row in rows[1:]:  # Skip the header row
-            cells = row.find_all('td')
-            if len(cells) != len(headers):
-                continue  # Skip rows with mismatched column counts
-
-            row_data = {"race_id": race_id, "race_url": url}
-            for header, cell in zip(headers, cells):
-                row_data[header] = cell.text.strip()
-                # Extract href if present
-                link = cell.find('a')
-                if link and link.get('href'):
-                    row_data[f"{header}_url"] = link.get('href')
-
-            all_data[table_type].append(row_data)
-
-        # Add metadata for the current table
-        metadata.append({
-            "race_id": race_id,
-            "url": url,
-            "table_index": table_index + 1,
-            "table_type": table_type,
-            "row_count": len(rows) - 1
-        })
-
-    metadata_df = pd.DataFrame(metadata)
-    return {
-        "individual": pd.DataFrame(all_data["individual"]),
-        "team": pd.DataFrame(all_data["team"])
-    }, metadata_df
-
-def detect_cole(html_content: str) -> float:
-    """
-    Detect whether HTML content matches Cole's results format.
-
-    Args:
-        html_content (str): Raw HTML string.
-
-    Returns:
-        float: Confidence score in [0,1]
-    """
-
-    REQUIRED_HEADERS_COLE = {"pl", "athlete", "yr", "team", "time"}
-
-    soup = BeautifulSoup(html_content, "html.parser")
+def detect_katie(html):
+    soup = BeautifulSoup(html, "html.parser")
     score = 0.0
 
-    # Identify results container
+    event_table = None
+    for tbl in soup.find_all("table"):
+        cls = tbl.get("class", [])
+        if isinstance(cls, str):
+            cls = cls.split()
+        tokens = [c.strip().lower() for c in cls]
+        if any("eventtable" == tok or "eventtable" in tok for tok in tokens):
+            event_table = tbl
+            break
+
+    if event_table is None:
+        return 0.0
+
+    score += 0.6
+
+    th_texts = [
+        th.get_text(" ", strip=True).lower()
+        for th in event_table.select("thead th")
+        if th.get_text(strip=True)
+    ]
+    headers_found = set(th_texts)
+    matched = len(REQUIRED_HEADERS_KATIE.intersection(headers_found))
+    if matched:
+        score += 0.3 * (matched / len(REQUIRED_HEADERS_KATIE))
+
+    links_in_body = event_table.select("tbody a[href]")
+    if len(links_in_body) >= 1:
+        score += 0.05
+    if len(links_in_body) >= 2:
+        score += 0.05
+
+    return min(score, 1.0)
+
+
+def detect_cole(html):
+    REQUIRED_HEADERS_COLE = {"pl", "athlete", "yr", "team", "time"}
+
+    soup = BeautifulSoup(html, "html.parser")
+    score = 0.0
+
     results_body = soup.find(id="meetResultsBody") or soup.find(class_="meetResultsBody")
     if not results_body:
         return 0.0
@@ -112,20 +72,17 @@ def detect_cole(html_content: str) -> float:
     pre_blocks = results_body.find_all("pre")
     table_blocks = results_body.find_all("table")
 
-    # Strong indicator — headers inside <pre>
     for pre in pre_blocks:
         text = pre.get_text(" ", strip=True).lower()
         if all(h in text for h in REQUIRED_HEADERS_COLE):
             score += 0.6
             break
 
-    # Secondary indicator — pre blocks exist & no tables exist
     if pre_blocks and not table_blocks:
         score += 0.3
     else:
         return 0.0
 
-    # Weak indicator — no "Team Scores" section
     found_team_scores = any("team scores" in pre.get_text().lower() for pre in pre_blocks)
     if not found_team_scores:
         score += 0.1
@@ -133,14 +90,47 @@ def detect_cole(html_content: str) -> float:
     return float(min(1.0, score))
 
 
-def wrangle_cole(html_content, race_url=None):
-    """
-    Parse Cole-style pages (<pre> based format).
-    Returns a DataFrame matching INDIVIDUAL_TABLE_HEADERS.
-    """
+def detect_max(html):
+    soup = BeautifulSoup(html, "html.parser")
+    score = 0.0
 
-    soup = BeautifulSoup(html_content, "html.parser")
+    target_table = None
+    for tbl in soup.find_all("table"):
+        classes = [c.lower() for c in tbl.get("class", [])]
+        if any("eventtable" in c for c in classes):
+            continue
+        target_table = tbl
+        break
 
+    if not target_table:
+        return 0.0
+
+    score += 0.6
+
+    REQUIRED_HEADERS = {"place", "athlete", "grade", "team", "avg mile", "finish", "points"}
+    th_texts = [th.get_text(" ", strip=True).lower() for th in target_table.find_all("th")]
+    headers_found = set(th_texts)
+
+    matched = len(REQUIRED_HEADERS.intersection(headers_found))
+    if matched:
+        score += 0.3 * (matched / len(REQUIRED_HEADERS))
+
+    links_in_body = target_table.select("tbody a[href]")
+    if len(links_in_body) == 0:
+        score += 0.1
+
+    return min(score, 1.0)
+
+
+def detect_adam(html):
+    return 0.0    # TODO
+
+
+# --------------------------------------------
+# WRANGLERS
+# --------------------------------------------
+def wrangle_cole(html, race_url=None):
+    soup = BeautifulSoup(html, "html.parser")
     results_div = soup.find("div", id="meetResultsBody")
     if not results_div:
         return pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS)
@@ -152,189 +142,188 @@ def wrangle_cole(html_content, race_url=None):
     text = pre.get_text("\n", strip=True)
     lines = text.splitlines()
 
-    # Lines starting with place #
     data_lines = [ln for ln in lines if re.match(r"^\s*\d+", ln)]
 
     rows = []
     for ln in data_lines:
         match = re.match(
-            r"^\s*(\d+)\s+(.+?)\s+(\d+)?\s+(.+?)\s+(\d{1,2}:\d{2}\.\d)", ln
+            r"^\s*(\d+)\s+(.+?)\s+(\d+)?\s+(.+?)\s+(\d{1,2}:\d{2}\.\d)",
+            ln
         )
-
         if not match:
             continue
 
-        place = int(match.group(1))
-        athlete = match.group(2).strip().title()
-        grade = int(match.group(3)) if match.group(3) else pd.NA
-        team = match.group(4).strip()
-        finish = match.group(5)
-
         rows.append({
-            "place": place,
+            "place": int(match.group(1)),
             "video": None,
-            "athlete": athlete,
-            "grade": grade,
-            "team": team,
-            "finish": finish,
+            "athlete": match.group(2).strip().title(),
+            "grade": int(match.group(3)) if match.group(3) else pd.NA,
+            "team": match.group(4).strip(),
+            "finish": match.group(5),
             "point": pd.NA
         })
 
     return pd.DataFrame(rows, columns=INDIVIDUAL_TABLE_HEADERS)
 
-# Max Detector Function Here:
 
-def detect_max(html: str) -> float: ## replace the function name with your own
-    """
-    Return a confidence in [0,1] that this HTML matches the 'Katie' format. 
-    NOTES FOR IMPLEMENTATION: 
-    - Name your function detect_YOURNAME 
-    - adjust signatures and weights for your format as needed 
-    - you do not need to include all types of signals shown here if you can generate a reliable score with fewer 
-    - be careful not to use signals that are too general and might appear in other formats 
-    - aim for a final score that is well-calibrated (e.g., real Katie files score near 1.0, non-Katie files near 0.0) 
-    
-    Signals: 
-    1) Table has class 'eventTable' (strong, +0.6) 
-    2) Header names include Place/Video/Athlete/Team/Mark/Points (secondary, up to +0.3) 
-    3) There are links (<a>) inside the table body (weak, +0.1)
-    """
-    ## Read in my html file with beautiful soup.
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    score = 0.0
-    # --- 1) Strong: find a table whose class list includes 'eventTable'
-    table = None
-    for tbl in soup.find_all("table"):
-        classes = [c.lower() for c in tbl.get("class", [])]
-        if not any("eventtable" in c for c in classes):
-            table = tbl
-            break
+def wrangle_max(html, race_url=None):
+    return pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS), pd.DataFrame(columns=TEAM_TABLE_HEADERS)
 
-    # If no EventTable found, score remains 0 and we exit early
-    if not table:
-        return 0.0  # early exit if no relevant table
 
-    score += 0.6  # found the old-style table
+def wrangle_adam(html, race_url=None):
+    return pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS), pd.DataFrame(columns=TEAM_TABLE_HEADERS)
 
-    # --- 2) Secondary: header names present (ignore blank headers like <th></th>) ---
-    REQUIRED_HEADERS = {"place", "athlete", "grade", "team", "avg mile", "finish", "points"}
-    th_texts = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
-    headers_found = set(th_texts)
-    matched = len(REQUIRED_HEADERS.intersection(headers_found))
 
-    if matched:
-        score += 0.3 * (matched / len(REQUIRED_HEADERS))  # proportional match
+def wrangle_katie(html, race_url=None):
+    return pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS), pd.DataFrame(columns=TEAM_TABLE_HEADERS)
 
-    # --- 3) Weak: presence of links in tbody (athlete/team profile links) ---
-    links_in_body = table.select("tbody a[href]")
-    if len(links_in_body) == 0:
-        score += 0.1
-    return min(score, 1.0) #return the final score, or 1 if the score is bigger than 1.
 
-score = detect_max(html) 
-print(f"Max format confidence score: {score:.2f}")
-
-# Function to process URLs and save data
-def process_urls_and_save(urls):
-    individual_results = pd.DataFrame()
-    team_results = pd.DataFrame()
-    metadata_results = pd.DataFrame()
+# --------------------------------------------
+# PROCESS ALL URLS
+# --------------------------------------------
+def process_all_urls(urls):
+    master_individual = []
+    master_team = []
+    master_metadata = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True, 
-            executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-        # Open a new page
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         for url in urls:
+            print(f"\n🔍 Processing URL: {url}")
+
             try:
-                # Navigate to the URL
-                page.goto(url)
-                page.wait_for_selector("table", timeout = 7000)  # Wait for at least one table to load
+                page.goto(url, timeout=20000)
+                html = page.content()
+                race_id = extract_race_id(url)
 
-                # Extract data
-                html_content = page.content()
-                
-                data, metadata = extract_table_data(html_content, url)
+                cole_score  = detect_cole(html)
+                katie_score = detect_katie(html)
+                max_score   = detect_max(html)
+                adam_score  = detect_adam(html)
 
-                # Run detectors on html_content
-                cole_score = detect_cole(html_content)
-                adam_score = detect_adam(html_content)
-                max_score = detect_max(html_content)
+                scores = {
+                    "cole": cole_score,
+                    "katie": katie_score,
+                    "max": max_score,
+                    "adam": adam_score
+                }
 
-                scores = {"cole": cole_score, "adam": adam_score, "max": max_score}
-                best_detector = max(scores, key=scores.get)
-                best_score = scores[best_detector]
+                best = max(scores, key=scores.get)
+                best_score = scores[best]
 
-                print(f"{url} → Best detector: {best_detector} (score: {best_score})")
+                print(f"   👉 Best detector = {best} (score={best_score:.2f})")
 
-                # Route HTML to proper wrangler based on best detector
-                wrangled_data = {"individual": pd.DataFrame(), "team": pd.DataFrame()}
+                if best_score < 0.7:
+                    print("   ❌ Low confidence — skipping")
+                    continue
 
-                if best_detector == "cole" and best_score >= 0.7:
-                    wrangled_df = wrangle_cole(html_content, url)
-                    wrangled_data["individual"] = wrangled_df
+                if best == "cole":
+                    indiv_df = wrangle_cole(html, url)
+                    team_df  = pd.DataFrame()
 
-                elif best_detector == "adam" and best_score >= 0.7:
-                    wrangled_df = wrangle_adam(html_content, url)
-                    # Adam code here
-                    print("Adam format")
+                elif best == "katie":
+                    indiv_df, team_df = wrangle_katie(html, url)
 
-                elif best_detector == "max" and best_score >= 0.7:
-                    wrangled_df = wrangle_max(html_content, url)
-                    # Max code here
-                    print("Max format")
-            
-                else:
-                    print(f"Low confidence ({best_score:.2f}) - skipping {url}")
-                    wrangled_data = {"individual": pd.DataFrame(), "team": pd.DataFrame()}
+                elif best == "max":
+                    indiv_df, team_df = wrangle_max(html, url)
 
-                # Append data to the respective DataFrames
-                if not data["individual"].empty:
-                    individual_results = pd.concat([individual_results, data["individual"]], ignore_index=True)
-                if not data["team"].empty:
-                    team_results = pd.concat([team_results, data["team"]], ignore_index=True)
-                if not metadata.empty:
-                    metadata_results = pd.concat([metadata_results, metadata], ignore_index=True)
+                elif best == "adam":
+                    indiv_df, team_df = wrangle_adam(html, url)
+
+                indiv_df["race_id"] = race_id
+                indiv_df["race_url"] = url
+                master_individual.append(indiv_df)
+
+                if not team_df.empty:
+                    team_df["race_id"] = race_id
+                    team_df["race_url"] = url
+                    master_team.append(team_df)
+
+                master_metadata.append(pd.DataFrame([{
+                    "race_id": race_id,
+                    "url": url,
+                    "detector": best,
+                    "score": best_score,
+                    "status": "success"
+                }]))
 
             except Exception as e:
-                print(f"Error processing URL {url}: {e}")
-                metadata_results = pd.concat([metadata_results, pd.DataFrame([{
+                print(f"   ERROR: {e}")
+                master_metadata.append(pd.DataFrame([{
                     "race_id": extract_race_id(url),
                     "url": url,
-                    "table_index": '',
-                    "table_type": f'error - {e}',
-                    "row_count": ''
-                }])], ignore_index=True)
+                    "detector": None,
+                    "score": None,
+                    "status": f"error: {e}"
+                }]))
 
         browser.close()
-    return individual_results, team_results, metadata_results
+
+    return (
+        pd.concat(master_individual, ignore_index=True) if master_individual else pd.DataFrame(),
+        pd.concat(master_team, ignore_index=True) if master_team else pd.DataFrame(),
+        pd.concat(master_metadata, ignore_index=True)
+    )
 
 
-# TESTING first 3 race_url!!!
+# --------------------------------------------
+# TEST 1 — Run script on FIRST 5 race URLs only
+# --------------------------------------------
 
-df = pd.read_csv(r"C:\Users\coleg\OneDrive\Documents\Econ Research Lab\Kurtis-Econ-Research-Lab-Fall-2025\race_urls_2016.0.csv")
+df = pd.read_csv(
+    r"C:\Users\coleg\OneDrive\Documents\Econ Research Lab\Kurtis-Econ-Research-Lab-Fall-2025\race_urls_2016.0.csv"
+)
 
-subset = df.iloc[:3]
-urls = subset["race_url"].tolist()
+test_urls = df["race_url"].head(5).tolist()
 
-for url in urls:
-    print(f"\nProcessing: {url}")
+print("\n==============================")
+print("  TEST MODE: FIRST 5 URLs")
+print("==============================\n")
 
-    indiv, team, meta = process_urls_and_save([url])
+individual, team, metadata = process_all_urls(test_urls)
 
-    race_id = extract_race_id(url)
-    if race_id is None:
-        race_id = url.split("/")[-2]
+print("\n--- Individual Results Preview ---")
+print(individual.head())
 
-    output_dir = r"C:\Users\coleg\OneDrive\Documents\Econ Research Lab\Kurtis-Econ-Research-Lab-Fall-2025\output"
+print("\n--- Team Results Preview ---")
+print(team.head())
 
-    indiv.to_csv(os.path.join(output_dir, f"individual_results_{race_id}.csv"), index=False)
-    team.to_csv(os.path.join(output_dir, f"team_results_{race_id}.csv"), index=False)
-    meta.to_csv(os.path.join(output_dir, f"metadata_results_{race_id}.csv"), index=False)
+print("\n--- Metadata Preview ---")
+print(metadata.head())
 
-    print(f"✓ Saved individual_results_{race_id}.csv")
-    print(f"✓ Saved team_results_{race_id}.csv")
-    print(f"✓ Saved metadata_results_{race_id}.csv")
+test_output_dir = (
+    r"C:\Users\coleg\OneDrive\Documents\Econ Research Lab\Kurtis-Econ-Research-Lab-Fall-2025\output\test_runs"
+)
+os.makedirs(test_output_dir, exist_ok=True)
+
+individual.to_csv(os.path.join(test_output_dir, "test_individual_first5.csv"), index=False)
+team.to_csv(os.path.join(test_output_dir, "test_team_first5.csv"), index=False)
+metadata.to_csv(os.path.join(test_output_dir, "test_metadata_first5.csv"), index=False)
+
+print("\n✓ TEST (first 5 URLs) COMPLETE — Files saved in test_runs\n")
+
+
+
+# FULL CSV RUN
+
+
+# print("\n===================================")
+# print("  FULL CSV RUN: Processing ALL URLs")
+# print("===================================\n")
+
+# all_urls = df["race_url"].tolist()
+# individual_all, team_all, metadata_all = process_all_urls(all_urls)
+
+# full_output_dir = (
+#     r"C:\Users\coleg\OneDrive\Documents\Econ Research Lab\Kurtis-Econ-Research-Lab-Fall-2025\output"
+# )
+
+# os.makedirs(full_output_dir, exist_ok=True)
+
+# individual_all.to_csv(os.path.join(full_output_dir, "all_individual_results.csv"), index=False)
+# team_all.to_csv(os.path.join(full_output_dir, "all_team_results.csv"), index=False)
+# metadata_all.to_csv(os.path.join(full_output_dir, "all_metadata.csv"), index=False)
+
+# print("\n✓ FULL CSV RUN COMPLETE — Output saved.\n")
