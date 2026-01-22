@@ -39,65 +39,14 @@ REQUIRED_HEADERS_MAX   = {"fr", "so", "jr", "sr"}             # class codes
 REQUIRED_HEADERS_ADAM  = {"place", "athlete", "grade", "school", "time"}
 
 
-def detect_katie(html: str) -> float:
-    """
-    Katie: table-based pages with td/ th classes like 'place', 'athlete', etc.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    score = 0.0
-
-    # 1) Look for tables that have many of the expected classes
-    tables = soup.find_all("table")
-    if not tables:
-        return 0.0
-
-    best_hit = 0
-    for tbl in tables:
-        cell_classes = set()
-        for cell in tbl.find_all(["td", "th"]):
-            cls = cell.get("class", [])
-            if isinstance(cls, str):
-                cls = cls.split()
-            for c in cls:
-                cell_classes.add(c.strip().lower())
-        hits = len(REQUIRED_HEADERS_KATIE.intersection(cell_classes))
-        best_hit = max(best_hit, hits)
-
-    if best_hit >= 3:
-        score += 0.6
-    elif best_hit >= 1:
-        score += 0.3
-
-    # 2) Presence of 'eventtable' style classes is a strong hint
-    has_event_table = False
-    for tbl in tables:
-        cls = tbl.get("class", [])
-        if isinstance(cls, str):
-            cls = cls.split()
-        tokens = [c.lower() for c in cls]
-        if any("eventtable" in tok for tok in tokens):
-            has_event_table = True
-            break
-    if has_event_table:
-        score += 0.3
-
-    # 3) Lots of links inside the table body (athlete/team URLs)
-    links = soup.select("table tbody a[href]")
-    if len(links) >= 5:
-        score += 0.1
-
-    return float(min(score, 1.0))
-
+# ============================================================
+# IMPROVED DETECTORS
+# ============================================================
 
 def detect_cole(html: str) -> float:
     """
-    Cole: PRE-based results inside #meetResultsBody, no tables.
-    Typical text looks like:
-        'Boys 3 mile run 1. 10 Brandon Tavarez 23:25 PR Robert F. Kennedy ...'
-    We key off:
-      - presence of <pre> in meetResultsBody
-      - repeated 'N.' place markers
-      - repeated time-like tokens
+    Cole: PRE-based results with NUMERIC grades (6, 7, 8, etc.)
+    Format: "   1 Name             7 School              12:46.8"
     """
     soup = BeautifulSoup(html, "html.parser")
     score = 0.0
@@ -106,53 +55,51 @@ def detect_cole(html: str) -> float:
     if not results_body:
         return 0.0
 
-    pre_blocks   = results_body.find_all("pre")
-    table_blocks = results_body.find_all("table")
-
+    pre_blocks = results_body.find_all("pre")
     if not pre_blocks:
         return 0.0
 
-    # flatten text
+    # Flatten text
     text_all = " ".join(pre.get_text(" ", strip=True) for pre in pre_blocks)
-    text_lower = text_all.lower()
-
-    # 1) time tokens
+    
+    # STRONG INDICATOR: Numeric grades (single digits) with surrounding structure
+    # Pattern: place number, then name, then single digit grade, then time
+    numeric_grade_pattern = re.compile(
+        r'\b\d+\s+[A-Za-z]+\s+[A-Za-z]+\s+(\d)\s+',  # Matches "1 First Last 7 "
+        re.MULTILINE
+    )
+    numeric_grades = numeric_grade_pattern.findall(text_all)
+    
+    if len(numeric_grades) >= 5:  # Found multiple numeric grades
+        score += 0.7
+    elif len(numeric_grades) >= 2:
+        score += 0.4
+    
+    # Time tokens
+    TIME_PATTERN = re.compile(r"\d+:\d{2}(?:\.\d+)?")
     times = TIME_PATTERN.findall(text_all)
     if len(times) >= 8:
-        score += 0.6
+        score += 0.2
     elif len(times) >= 4:
-        score += 0.4
-    elif len(times) >= 1:
-        score += 0.2
-
-    # 2) place markers like "1." "2." etc
-    place_markers = re.findall(r"\b\d+\.", text_all)
-    if len(place_markers) >= 6:
-        score += 0.3
-    elif len(place_markers) >= 2:
-        score += 0.2
-
-    # 3) generic hints in header text
-    if any(h in text_lower for h in REQUIRED_HEADERS_COLE):
         score += 0.1
-
-    # penalize if tables exist (then it's probably not Cole)
-    if table_blocks:
-        score *= 0.3
-    else:
-        score += 0.1
-
-    # penalize if heavy use of FR/SO/JR/SR (that smells like Max instead)
-    grade_tokens = re.findall(r"\b(FR|SO|JR|SR)\b", text_all)
+    
+    # Place markers with leading spaces (Cole format has "   1" not "1.")
+    place_markers = re.findall(r'^\s+\d+\s', text_all, re.MULTILINE)
+    if len(place_markers) >= 5:
+        score += 0.15
+    
+    # PENALTY: FR/SO/JR/SR indicates Max format, not Cole
+    grade_tokens = re.findall(r'\b(FR|SO|JR|SR)\b', text_all)
     if len(grade_tokens) >= 3:
-        score *= 0.5
-
+        score *= 0.3  # Strong penalty
+    
     return float(min(score, 1.0))
 
 
 def detect_max(html: str) -> float:
     """
     Max: PRE-based results with FR/SO/JR/SR grade codes.
+    Format: "1   Daniel Filipcik         SR   Woodside    5:11    15:18"
     """
     soup = BeautifulSoup(html, "html.parser")
     score = 0.0
@@ -161,45 +108,44 @@ def detect_max(html: str) -> float:
     if not results_body:
         return 0.0
 
-    pre_blocks   = results_body.find_all("pre")
-    table_blocks = results_body.find_all("table")
+    pre_blocks = results_body.find_all("pre")
     if not pre_blocks:
         return 0.0
 
-    text_all   = " ".join(pre.get_text(" ", strip=True) for pre in pre_blocks)
-    text_lower = text_all.lower()
-
-    # 1) FR/SO/JR/SR tokens
-    grade_tokens = re.findall(r"\b(FR|SO|JR|SR)\b", text_all)
-    if len(grade_tokens) >= 6:
-        score += 0.6
-    elif len(grade_tokens) >= 3:
-        score += 0.4
+    text_all = " ".join(pre.get_text(" ", strip=True) for pre in pre_blocks)
+    
+    # STRONG INDICATOR: FR/SO/JR/SR tokens
+    grade_tokens = re.findall(r'\b(FR|SO|JR|SR)\b', text_all)
+    if len(grade_tokens) >= 8:  # Many grade codes
+        score += 0.7
+    elif len(grade_tokens) >= 4:
+        score += 0.5
     elif len(grade_tokens) >= 1:
         score += 0.2
-
-    # 2) time tokens
+    
+    # Time tokens
+    TIME_PATTERN = re.compile(r"\d+:\d{2}(?:\.\d+)?")
     times = TIME_PATTERN.findall(text_all)
     if len(times) >= 5:
-        score += 0.3
-    elif len(times) >= 2:
         score += 0.2
-
-    # 3) no tables -> more likely Max than Adam
-    if not table_blocks:
-        score += 0.1
-
-    # mild hint words
-    if "team scores" in text_lower:
-        score += 0.1
-
+    
+    # Team scores section (common in Max format)
+    if re.search(r'Team\s+Scores', text_all, re.IGNORECASE):
+        score += 0.15
+    
+    # PENALTY: Single digit grades indicate Cole format
+    numeric_grade_pattern = re.compile(r'\b\d+\s+[A-Za-z]+\s+[A-Za-z]+\s+(\d)\s+')
+    numeric_grades = numeric_grade_pattern.findall(text_all)
+    if len(numeric_grades) >= 3:
+        score *= 0.4  # Penalty for Cole indicators
+    
     return float(min(score, 1.0))
 
 
 def detect_adam(html: str) -> float:
     """
-    Adam: table-based inside meetResultsBody with headers
-    like Place / Athlete / Grade / School / Time.
+    Adam: Simple TABLE-based format with <td> cells.
+    Format: <table><tr><td>Place</td><td>Athlete</td><td>Grade</td><td>School</td><td>Time</td></tr>
     """
     soup = BeautifulSoup(html, "html.parser")
     score = 0.0
@@ -211,39 +157,108 @@ def detect_adam(html: str) -> float:
     tables = container.find_all("table")
     if not tables:
         return 0.0
-
-    # 1) header coverage
-    best_header_score = 0.0
-    for tbl in tables:
-        headers = {
-            th.get_text(" ", strip=True).lower()
-            for th in tbl.find_all(["th", "td"])
-        }
-        intersection = REQUIRED_HEADERS_ADAM.intersection(headers)
-        if intersection:
-            best_header_score = max(
-                best_header_score,
-                len(intersection) / len(REQUIRED_HEADERS_ADAM)
-            )
-
-    if best_header_score >= 0.6:
-        score += 0.7
-    elif best_header_score >= 0.3:
-        score += 0.4
-
-    # 2) presence of paging/filtering controls
-    header_structure = soup.find("form", id="frmMeetResultsDetailFilter")
-    if header_structure:
-        select_box = header_structure.find("select", id="ddResultsPage")
-        if select_box and select_box.find_all("option"):
+    
+    # STRONG INDICATOR: Table exists in meetResultsBody
+    score += 0.3
+    
+    # Look for header row patterns
+    best_header_match = 0
+    expected_headers = {'place', 'athlete', 'grade', 'school', 'time'}
+    
+    for table in tables:
+        # Get first row (likely headers)
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+            
+        first_row_cells = rows[0].find_all(["td", "th"])
+        if len(first_row_cells) >= 4:  # Has multiple columns
+            # Extract text from first row
+            header_texts = {cell.get_text(" ", strip=True).lower() 
+                          for cell in first_row_cells}
+            
+            # Check for expected headers
+            matches = len(expected_headers.intersection(header_texts))
+            best_header_match = max(best_header_match, matches)
+    
+    # Score based on header matches
+    if best_header_match >= 4:
+        score += 0.5
+    elif best_header_match >= 3:
+        score += 0.3
+    elif best_header_match >= 2:
+        score += 0.2
+    
+    # Check table structure (many data rows)
+    for table in tables:
+        rows = table.find_all("tr")
+        data_rows = [r for r in rows if len(r.find_all("td")) >= 4]
+        
+        if len(data_rows) >= 10:  # Has many data rows
             score += 0.2
+            break
+        elif len(data_rows) >= 5:
+            score += 0.1
+            break
+    
+    return float(min(score, 1.0))
 
-    # 3) multiple tables usually means individual + team
-    if len(tables) >= 2:
+
+def detect_katie(html: str) -> float:
+    """
+    Katie: Complex table-based pages with class-based cells 
+    (e.g., <td class="place">, <td class="athlete">)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    score = 0.0
+
+    REQUIRED_HEADERS_KATIE = {"place", "video", "athlete", "grade", "team", "finish", "point"}
+    
+    tables = soup.find_all("table")
+    if not tables:
+        return 0.0
+
+    best_hit = 0
+    for tbl in tables:
+        # Look for class-based cells
+        cell_classes = set()
+        for cell in tbl.find_all(["td", "th"]):
+            cls = cell.get("class", [])
+            if isinstance(cls, str):
+                cls = cls.split()
+            for c in cls:
+                cell_classes.add(c.strip().lower())
+        
+        hits = len(REQUIRED_HEADERS_KATIE.intersection(cell_classes))
+        best_hit = max(best_hit, hits)
+
+    # STRONG INDICATOR: Class-based table structure
+    if best_hit >= 5:  # Many Katie-specific classes
+        score += 0.7
+    elif best_hit >= 3:
+        score += 0.5
+    elif best_hit >= 1:
+        score += 0.2
+
+    # Look for 'eventtable' style classes
+    has_event_table = False
+    for tbl in tables:
+        cls = tbl.get("class", [])
+        if isinstance(cls, str):
+            cls = cls.split()
+        if any("eventtable" in c.lower() for c in cls):
+            has_event_table = True
+            break
+    
+    if has_event_table:
+        score += 0.2
+
+    # Links inside table (athlete/team URLs)
+    links = soup.select("table tbody a[href]")
+    if len(links) >= 5:
         score += 0.1
 
     return float(min(score, 1.0))
-
 
 # ============================================================
 # WRANGLERS
@@ -706,6 +721,174 @@ def process_urls_and_save_wrapped(urls):
     return individual_results, team_results, metadata_results
 
 
+def test_format_detection():
+    """
+    Test the improved detectors on the 3 known format examples.
+    """
+    test_cases = [
+        {
+            "url": "https://ca.milesplit.com/meets/494231-cvl-meet-3-ace-2022/results/846020/raw",
+            "expected": "cole",
+            "description": "Cole format - PRE with numeric grades (6, 7, 8)"
+        },
+        {
+            "url": "https://ca.milesplit.com/meets/44115-aragons-center-meet-3-2008/results/80586/raw",
+            "expected": "max",
+            "description": "Max format - PRE with FR/SO/JR/SR grades"
+        },
+        {
+            "url": "https://ca.milesplit.com/meets/493916-cvaa-preview-2022/results/846055/raw",
+            "expected": "adam",
+            "description": "Adam format - Simple HTML tables"
+        },
+    ]
+    
+    print("=" * 80)
+    print("TESTING IMPROVED DETECTORS ON KNOWN FORMATS")
+    print("=" * 80)
+    print()
+    
+    results = []
+    
+    with sync_playwright() as p:
+        print("🌐 Launching browser...")
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        
+        for i, test in enumerate(test_cases, 1):
+            print(f"\n{'=' * 80}")
+            print(f"TEST {i}/3: {test['description']}")
+            print(f"URL: {test['url']}")
+            print(f"Expected format: {test['expected'].upper()}")
+            print(f"{'=' * 80}")
+            
+            try:
+                # Fetch the page
+                print("📥 Fetching page...")
+                page.goto(test['url'], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2000)
+                html = page.content()
+                
+                # Run all detectors
+                print("🔍 Running detectors...")
+                scores = {
+                    "cole": detect_cole(html),
+                    "max": detect_max(html),
+                    "adam": detect_adam(html),
+                    "katie": detect_katie(html)
+                }
+                
+                # Determine winner
+                best_format = max(scores, key=scores.get)
+                best_score = scores[best_format]
+                
+                # Display results
+                print("\n📊 DETECTOR SCORES:")
+                for format_name, score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+                    indicator = "👉" if format_name == best_format else "  "
+                    star = "⭐" if format_name == test['expected'] else "  "
+                    print(f"  {indicator} {star} {format_name.ljust(8)}: {score:.3f}")
+                
+                print(f"\n🎯 Best match: {best_format.upper()} (score: {best_score:.3f})")
+                print(f"🎯 Threshold check: {'PASS' if best_score >= 0.70 else '❌ FAIL'} (>= 0.70)")
+                
+                # Check if correct
+                is_correct = best_format == test['expected']
+                results.append({
+                    'test': test['description'],
+                    'expected': test['expected'],
+                    'detected': best_format,
+                    'score': best_score,
+                    'correct': is_correct
+                })
+                
+                if is_correct:
+                    print(f"\n SUCCESS: Correctly identified as {test['expected'].upper()} format!")
+                else:
+                    print(f"\nFAILURE: Expected {test['expected'].upper()} but got {best_format.upper()}")
+                
+            except Exception as e:
+                print(f"\n  ERROR: {e}")
+                results.append({
+                    'test': test['description'],
+                    'expected': test['expected'],
+                    'detected': 'ERROR',
+                    'score': 0.0,
+                    'correct': False
+                })
+        
+        browser.close()
+    
+    # Summary
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+    
+    correct_count = sum(1 for r in results if r['correct'])
+    total_count = len(results)
+    
+    print(f"\n Correct detections: {correct_count}/{total_count}")
+    print(f" Success rate: {(correct_count/total_count)*100:.1f}%")
+    
+    print("\n📋 Detailed Results:")
+    print("-" * 80)
+    for r in results:
+        status = "✅" if r['correct'] else "❌"
+        print(f"{status} {r['test']}")
+        print(f"   Expected: {r['expected'].upper()} | Detected: {r['detected'].upper()} | Score: {r['score']:.3f}")
+    
+    print("\n" + "=" * 80)
+    
+    if correct_count == total_count:
+        print("ALL TESTS PASSED! The improved detectors are working correctly!")
+    else:
+        print("Some tests failed. Review the scores above for details.")
+    
+    print("=" * 80)
+    print()
+
+
+if __name__ == "__main__":
+    test_format_detection()
+
+
+if __name__ == "__main__":
+    test_format_detection()
+
+# ============================================================
+# FULL RUN MODE - Process all URLs from CSV
+# ============================================================
+'''''
+if __name__ == "__main__":
+    input_csv = "race_urls_2016.0.csv"
+    
+    print("\n==============================")
+    print("  FULL RUN: ALL URLs from 2016")
+    print("==============================\n")
+    
+    # Load the CSV
+    df = pd.read_csv(input_csv)
+    urls_all = df["race_url"].tolist()
+    
+    print(f"Processing {len(urls_all)} URLs...")
+    
+    # Process all URLs
+    individual_all, team_all, metadata_all = process_urls_and_save_wrapped(urls_all)
+    
+    # Save results
+    output_dir = "output/full_run_2016"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    individual_all.to_csv(os.path.join(output_dir, "individual.csv"), index=False)
+    team_all.to_csv(os.path.join(output_dir, "team.csv"), index=False)
+    metadata_all.to_csv(os.path.join(output_dir, "metadata.csv"), index=False)
+    
+    print(f"\n✓ FULL RUN COMPLETE")
+    print(f"   Results saved to: {output_dir}")
+    print(f"   Individual results: {len(individual_all)} rows")
+    print(f"   Team results: {len(team_all)} rows")
+'''
+
 # ============================================================
 # DIAGNOSTIC MODE — SAMPLE SUBSET OF URLS
 # ============================================================
@@ -715,7 +898,7 @@ if __name__ == "__main__":
 
     df   = pd.read_csv(input_csv)
     # adjust n as you like; 80 is a decent compromise
-    urls = df["race_url"].sample(n=80, random_state=42).tolist()
+    urls = df["race_url"].sample(n=50, random_state=42).tolist()
 
     print("\n==============================")
     print("  DIAGNOSTIC MODE: 80 URLs")
