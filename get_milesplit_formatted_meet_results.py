@@ -141,67 +141,81 @@ def detect_max(html: str) -> float:
     
     return float(min(score, 1.0))
 
+from typing import Iterable, Set
+from bs4 import BeautifulSoup, Tag
 
+# --- Configuration ---
+REQUIRED_HEADERS_ADAM = {"place", "athlete", "grade", "school", "time"}
+
+# --- Weights ---
+W_STRONG = 0.65
+W_HEADERS = 0.3
+W_TABLECOUNT = 0.05
+W_STRUCTURE = 0.20   # NEW bonus for Milesplit results header structure
+
+
+def _normalize_tokens(tokens: Iterable[str]) -> Set[str]:
+    return {t.strip().lower() for t in tokens if t and t.strip()}
+
+
+def has_milesplit_results_header_structure(soup: BeautifulSoup) -> bool:
+    article = soup.find("article")
+    if not article:
+        return False
+    header = article.find("header")
+    if not header:
+        return False
+    form = header.find("form", id="frmMeetResultsDetailFilter")
+    if not form:
+        return False
+    select = form.find("select", id="ddResultsPage")
+    if not select:
+        return False
+    if not select.find_all("option"):
+        return False
+
+    return True
+
+
+def _find_meetresults_tables(soup: BeautifulSoup) -> list[Tag]:
+    container = soup.find(id="meetResultsBody") or soup.find("div", id="meetResultsBody")
+    if not container:
+        return []
+    return container.find_all("table")
+
+
+# --- Main detector ---
 def detect_adam(html: str) -> float:
-    """
-    Adam: Simple TABLE-based format with <td> cells.
-    Format: <table><tr><td>Place</td><td>Athlete</td><td>Grade</td><td>School</td><td>Time</td></tr>
-    """
     soup = BeautifulSoup(html, "html.parser")
     score = 0.0
 
-    container = soup.find(id="meetResultsBody") or soup.find(class_="meetResultsBody")
-    if not container:
-        return 0.0
+    if has_milesplit_results_header_structure(soup):
+        score += W_STRUCTURE
 
-    tables = container.find_all("table")
+    tables = _find_meetresults_tables(soup)
     if not tables:
-        return 0.0
-    
-    # STRONG INDICATOR: Table exists in meetResultsBody
-    score += 0.3
-    
-    # Look for header row patterns
-    best_header_match = 0
-    expected_headers = {'place', 'athlete', 'grade', 'school', 'time'}
-    
-    for table in tables:
-        # Get first row (likely headers)
-        rows = table.find_all("tr")
-        if len(rows) < 2:
-            continue
-            
-        first_row_cells = rows[0].find_all(["td", "th"])
-        if len(first_row_cells) >= 4:  # Has multiple columns
-            # Extract text from first row
-            header_texts = {cell.get_text(" ", strip=True).lower() 
-                          for cell in first_row_cells}
-            
-            # Check for expected headers
-            matches = len(expected_headers.intersection(header_texts))
-            best_header_match = max(best_header_match, matches)
-    
-    # Score based on header matches
-    if best_header_match >= 4:
-        score += 0.5
-    elif best_header_match >= 3:
-        score += 0.3
-    elif best_header_match >= 2:
-        score += 0.2
-    
-    # Check table structure (many data rows)
-    for table in tables:
-        rows = table.find_all("tr")
-        data_rows = [r for r in rows if len(r.find_all("td")) >= 4]
-        
-        if len(data_rows) >= 10:  # Has many data rows
-            score += 0.2
-            break
-        elif len(data_rows) >= 5:
-            score += 0.1
-            break
-    
-    return float(min(score, 1.0))
+        return score  # no tables → return whatever structural score we have
+
+    # Strong match for meetResultsBody structure
+    score += W_STRONG
+
+    # Header match (use best-scoring table)
+    best_header_score = 0.0
+    for tbl in tables:
+        headers = _normalize_tokens(
+            th.get_text(" ", strip=True)
+            for th in tbl.find_all(["th", "td"])
+        )
+        overlap = len(REQUIRED_HEADERS_ADAM.intersection(headers))
+        if overlap:
+            best_header_score = max(best_header_score, overlap / len(REQUIRED_HEADERS_ADAM))
+
+    score += W_HEADERS * best_header_score
+
+    if len(tables) >= 2:
+        score += W_TABLECOUNT
+
+    return min(score, 1.0)
 
 
 def detect_katie(html: str) -> float:
@@ -898,7 +912,7 @@ if __name__ == "__main__":
 
     df   = pd.read_csv(input_csv)
     # adjust n as you like; 80 is a decent compromise
-    urls = df["race_url"].sample(n=50, random_state=42).tolist()
+    urls = df["race_url"].tolist()
 
     print("\n==============================")
     print("  DIAGNOSTIC MODE: 80 URLs")
@@ -946,7 +960,7 @@ if __name__ == "__main__":
     # urls_all = df["race_url"].tolist()
     # individual_all, team_all, metadata_all = process_urls_and_save_wrapped(urls_all)
     #
-    # full_output_dir = r"C:\Users\coleg\OneDrive\Documents\Econ Research Lab\Kurtis-Econ-Research-Lab-Fall-2025\output\full_run"
+    # full_output_dir = r"output/full_run_all"
     # os.makedirs(full_output_dir, exist_ok=True)
     # individual_all.to_csv(os.path.join(full_output_dir, "individual.csv"), index=False)
     # team_all.to_csv(os.path.join(full_output_dir, "team.csv"), index=False)
