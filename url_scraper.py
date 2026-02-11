@@ -8,7 +8,7 @@ from selenium.webdriver.chrome.options import Options
 # --------------------------------------------------
 # CONFIGURATION
 # --------------------------------------------------
-STATE_SUBDOMAIN = "wa"
+STATE_SUBDOMAIN = "ut"
 BASE_URL = f"https://{STATE_SUBDOMAIN}.milesplit.com/results"
 
 YEARS = range(2015, 2021)           # 2015 → 2020
@@ -17,7 +17,7 @@ SEASON = "cross_country"
 LEVEL = "hs"
 
 OUTPUT_DIR = "data"
-OUTPUT_FILE = f"{OUTPUT_DIR}/wa_hs_xc_meet_urls_2015_2020.csv"
+OUTPUT_FILE = f"{OUTPUT_DIR}/ut_hs_xc_meet_urls_2015_2020.csv"
 
 # --------------------------------------------------
 # SET UP OUTPUT DIRECTORY
