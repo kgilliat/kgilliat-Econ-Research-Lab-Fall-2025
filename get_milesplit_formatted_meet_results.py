@@ -764,6 +764,10 @@ def extract_table_data_wrapped(page_content: str, url: str):
 # PROCESS URLS
 # ============================================================
 
+# ============================================================
+# PROCESS URLS
+# ============================================================
+
 def get_chrome_path():
     system = platform.system()
 
@@ -855,6 +859,160 @@ def process_urls_and_save_wrapped(urls):
 
 
 # ============================================================
+# MULTI-RACE MEET PARSER (for failed URLs)
+# ============================================================
+
+def scrape_multi_race_meet(url: str, page):
+    """
+    Handles meet pages where individual race results are on separate pages.
+    Extracts race links from the meet page and scrapes each race.
+    
+    Returns: (individual_df, team_df, metadata_df)
+    """
+    print(f"   Attempting multi-race meet scrape for: {url}")
+    
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=120000)
+        
+        # Wait for the page to load
+        try:
+            page.wait_for_selector("a[href*='/results/']", timeout=6000)
+        except Exception:
+            pass
+        
+        html_content = page.content()
+        soup = _build_soup(html_content)
+        
+        # Find all race result links on the meet page
+        race_links = []
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "")
+            # Look for links that go to /results/ pages
+            if "/results/" in href and href not in race_links:
+                # Make absolute URL if needed
+                if href.startswith("/"):
+                    # Extract domain from original URL
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    full_url = f"{parsed.scheme}://{parsed.netloc}{href}"
+                    race_links.append(full_url)
+                elif href.startswith("http"):
+                    race_links.append(href)
+        
+        if not race_links:
+            print(f"   No race links found on meet page: {url}")
+            return None, None, None
+        
+        print(f"   Found {len(race_links)} race links to scrape")
+        
+        # Scrape each individual race
+        all_indiv_chunks = []
+        all_team_chunks = []
+        all_meta_chunks = []
+        
+        for i, race_url in enumerate(race_links, start=1):
+            print(f"   [{i}/{len(race_links)}] Scraping race: {race_url}")
+            
+            try:
+                page.goto(race_url, wait_until="domcontentloaded", timeout=120000)
+                
+                try:
+                    page.wait_for_selector("#meetResultsBody table, #meetResultsBody pre, table, pre", timeout=6000)
+                except Exception:
+                    pass
+                
+                race_html = page.content()
+                data, meta = extract_table_data_wrapped(race_html, race_url)
+                
+                indiv = data.get("individual", pd.DataFrame())
+                team = data.get("team", pd.DataFrame())
+                
+                if isinstance(indiv, pd.DataFrame) and not indiv.empty:
+                    all_indiv_chunks.append(indiv)
+                if isinstance(team, pd.DataFrame) and not team.empty:
+                    all_team_chunks.append(team)
+                if isinstance(meta, pd.DataFrame) and not meta.empty:
+                    all_meta_chunks.append(meta)
+                    
+            except Exception as e:
+                print(f"   ⚠ Failed to scrape race {race_url}: {e}")
+                continue
+        
+        # Combine all race results
+        individual_df = pd.concat(all_indiv_chunks, ignore_index=True) if all_indiv_chunks else pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS)
+        team_df = pd.concat(all_team_chunks, ignore_index=True) if all_team_chunks else pd.DataFrame(columns=TEAM_TABLE_HEADERS)
+        metadata_df = pd.concat(all_meta_chunks, ignore_index=True) if all_meta_chunks else pd.DataFrame()
+        
+        return individual_df, team_df, metadata_df
+        
+    except Exception as e:
+        print(f"   ⚠ Multi-race meet scrape failed for {url}: {e}")
+        return None, None, None
+
+
+def retry_failed_urls(failed_metadata, original_indiv, original_team, original_meta):
+    """
+    Retry URLs that returned 0 rows using the multi-race meet scraper.
+    
+    Args:
+        failed_metadata: metadata DataFrame with row_count info
+        original_indiv: original individual results
+        original_team: original team results
+        original_meta: original metadata
+    
+    Returns: (updated_indiv, updated_team, updated_meta)
+    """
+    # Find URLs with 0 rows
+    zero_row_urls = failed_metadata[failed_metadata["row_count"] == 0]["url"].unique().tolist()
+    
+    if not zero_row_urls:
+        print("\nNo failed URLs to retry.")
+        return original_indiv, original_team, original_meta
+    
+    print(f"\n{'='*60}")
+    print(f"RETRYING {len(zero_row_urls)} FAILED URLs WITH MULTI-RACE PARSER")
+    print(f"{'='*60}\n")
+    
+    retry_indiv_chunks = [original_indiv] if not original_indiv.empty else []
+    retry_team_chunks = [original_team] if not original_team.empty else []
+    retry_meta_chunks = [original_meta] if not original_meta.empty else []
+    
+    with sync_playwright() as p:
+        chrome_path = get_chrome_path()
+        
+        if chrome_path and os.path.exists(chrome_path):
+            browser = p.chromium.launch(headless=True, executable_path=chrome_path)
+        else:
+            browser = p.chromium.launch(headless=True)
+        
+        context = browser.new_context()
+        page = context.new_page()
+        
+        for i, url in enumerate(zero_row_urls, start=1):
+            print(f"\n[RETRY {i}/{len(zero_row_urls)}] Processing: {url}")
+            
+            indiv, team, meta = scrape_multi_race_meet(url, page)
+            
+            if indiv is not None and not indiv.empty:
+                retry_indiv_chunks.append(indiv)
+                print(f"   ✓ Successfully scraped {len(indiv)} individual results")
+            if team is not None and not team.empty:
+                retry_team_chunks.append(team)
+            if meta is not None and not meta.empty:
+                retry_meta_chunks.append(meta)
+        
+        context.close()
+        browser.close()
+    
+    # Combine all results
+    final_indiv = pd.concat(retry_indiv_chunks, ignore_index=True) if retry_indiv_chunks else pd.DataFrame(columns=INDIVIDUAL_TABLE_HEADERS)
+    final_team = pd.concat(retry_team_chunks, ignore_index=True) if retry_team_chunks else pd.DataFrame(columns=TEAM_TABLE_HEADERS)
+    final_meta = pd.concat(retry_meta_chunks, ignore_index=True) if retry_meta_chunks else pd.DataFrame()
+    
+    return final_indiv, final_team, final_meta
+
+
+# ============================================================
 # DIAGNOSTIC MODE — SAMPLE SUBSET OF URLS
 # ============================================================
 
@@ -862,10 +1020,13 @@ if __name__ == "__main__":
     input_csv = r"data/wa_hs_xc_meet_urls_2015_2020.csv"
 
     df = pd.read_csv(input_csv)
-    urls = df["race_url"].sample(n=80).tolist()
+    
+    # Choose one option:
+    urls = df["race_url"].sample(n=80).tolist()  # Test with 80 URLs
+    # urls = df["race_url"].tolist()  # Process all URLs
 
     print("\n==============================")
-    print(f"  DIAGNOSTIC MODE: {len(urls)} urls")
+    print(f"  PROCESSING {len(urls)} urls")
     print("==============================\n")
 
     individual, team, metadata = process_urls_and_save_wrapped(urls)
@@ -876,7 +1037,7 @@ if __name__ == "__main__":
     else:
         metadata["row_count"] = 0
 
-    print("\n=== PARSER FAILURE SUMMARY ===")
+    print("\n=== INITIAL PARSER FAILURE SUMMARY ===")
     if "assigned_parser" not in metadata.columns:
         metadata["assigned_parser"] = "unknown"
 
@@ -887,6 +1048,22 @@ if __name__ == "__main__":
     )
     summary["failure_rate"] = summary["urls_with_zero_rows"] / summary["urls_assigned"]
     print(summary)
+    
+    # Retry failed URLs with multi-race parser
+    individual, team, metadata = retry_failed_urls(metadata, individual, team, metadata)
+    
+    # Final summary after retry
+    print("\n=== FINAL PARSER SUMMARY (AFTER RETRY) ===")
+    if "row_count" in metadata.columns:
+        metadata["row_count"] = pd.to_numeric(metadata["row_count"], errors="coerce").fillna(0)
+    
+    final_summary = (
+        metadata.groupby("assigned_parser")["row_count"]
+        .agg(["count", lambda x: (x == 0).sum()])
+        .rename(columns={"count": "urls_assigned", "<lambda_0>": "urls_with_zero_rows"})
+    )
+    final_summary["failure_rate"] = final_summary["urls_with_zero_rows"] / final_summary["urls_assigned"]
+    print(final_summary)
 
     output_dir = r"output/diagnostic"
     os.makedirs(output_dir, exist_ok=True)
@@ -894,4 +1071,6 @@ if __name__ == "__main__":
     team.to_csv(os.path.join(output_dir, "diag_team.csv"), index=False)
     metadata.to_csv(os.path.join(output_dir, "diag_metadata.csv"), index=False)
 
-    print("\nDiagnostic complete. Files saved in 'output/diagnostic'.\n")
+    print(f"\nProcessing complete. Files saved in 'output/diagnostic'.")
+    print(f"Total individual results: {len(individual)}")
+    print(f"Total team results: {len(team)}\n")
