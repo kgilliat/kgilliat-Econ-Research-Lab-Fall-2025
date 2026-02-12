@@ -11,7 +11,7 @@ from selenium.webdriver.chrome.options import Options
 STATE_SUBDOMAIN = "ut"
 BASE_URL = f"https://{STATE_SUBDOMAIN}.milesplit.com/results"
 
-YEARS = range(2015, 2021)           # 2015 → 2020
+YEARS = range(2015, 2021)           # 2015 → 2020git
 MONTHS = [8, 9, 10, 11]             # Typical XC season
 SEASON = "cross_country"
 LEVEL = "hs"
@@ -72,7 +72,7 @@ for year in YEARS:
                         "meet_url": meet_url,
                         "year": year,
                         "month": month,
-                        "state": "WA",
+                        "state": "UT",
                         "level": "HS",
                         "season": "XC"
                     })
