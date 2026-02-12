@@ -859,7 +859,7 @@ def process_urls_and_save_wrapped(urls):
 # ============================================================
 
 if __name__ == "__main__":
-    input_csv = r"race_urls_2016.0.csv"
+    input_csv = r"data/ut_hs_xc_meet_urls_2015_2020.csv"
 
     df = pd.read_csv(input_csv)
     urls = df["race_url"].sample(n=80).tolist()
