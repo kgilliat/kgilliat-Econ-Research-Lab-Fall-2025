@@ -1017,13 +1017,13 @@ def retry_failed_urls(failed_metadata, original_indiv, original_team, original_m
 # ============================================================
 
 if __name__ == "__main__":
-    input_csv = r"data/wa_hs_xc_meet_urls_2015_2020.csv"
+    input_csv = r"data/ut_hs_xc_meet_urls_2015_2020.csv"
 
     df = pd.read_csv(input_csv)
     
     # Choose one option:
-    urls = df["race_url"].sample(n=80).tolist()  # Test with 80 URLs
-    # urls = df["race_url"].tolist()  # Process all URLs
+    #urls = df["race_url"].sample(n=80).tolist()  # Test with 80 URLs
+    urls = df["race_url"].tolist()  # Process all URLs
 
     print("\n==============================")
     print(f"  PROCESSING {len(urls)} urls")
